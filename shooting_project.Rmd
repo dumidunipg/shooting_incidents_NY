@@ -3,7 +3,6 @@ title: "Shooting Incidents in New York Project"
 date: "2024-12-01"
 output:
   html_document: default
-  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
