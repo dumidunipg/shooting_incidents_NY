@@ -1,0 +1,317 @@
+---
+title: "Shooting Incidents in New York Project"
+date: "2024-12-01"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+## Introduction
+
+This project looks into the NYPD Shooting Incident Data obtained from <https://catalog.data.gov/dataset/nypd-shooting-incident-data-historic>. The data describes shooting incidents in New York City dating back to 2006 and provides information about exact location, time, and information about the victim and suspect.Through this analysis, we aim to identify key factors that contribute to fatal shootings and to explore how variables such as borough, race, age, and gender of both the victim and perpetrator play a role in the likelihood of a shooting incident resulting in death.
+
+**Columns**
+
+- **INCIDENT_KEY**: Randomly generated persistent ID for each arrest  
+- **OCCUR_DATE**: Date of the shooting  
+- **OCCUR_TIME**: Time of the shooting  
+- **BORO**: Borough where shooting occurred  
+- **LOC_OF_OCCUR_DESC**: REMOVED  
+- **PRECINCT**: Precinct where shooting occurred  
+- **JURISDICTION_CODE**: 0 (Patrol), 1 (Transit), 2 (Housing), 3 and more represent non-NYPD Jurisdictions  
+- **LOC_CLASSFCTN_DESC**: REMOVED  
+- **LOCATION_DESC**: REMOVED  
+- **STATISTICAL_MURDER_FLAG**: Shooting resulted in victim’s death  
+- **PERP_AGE_GROUP**  
+- **PERP_SEX**  
+- **PERP_RACE**  
+- **VIC_AGE_GROUP**  
+- **VIC_SEX**  
+- **VIC_RACE**  
+- **X_COORD_CD**: Midblock X-coordinate for New York State Plane Coordinate System, Long Island Zone, NAD 83, units feet (FIPS 3104)  
+- **Y_COORD_CD**: Midblock Y-coordinate for New York State Plane Coordinate System, Long Island Zone, NAD 83, units feet (FIPS 3104)  
+- **Latitude**  
+- **Longitude**  
+- **Lon_Lat**  
+
+
+
+## Load the Libraries
+
+```{r}
+
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(leaflet)
+library(leaflet.extras)
+library(plotly)
+library(randomForest)
+library(e1071)
+library(caret)
+library(caTools)
+```
+
+## Importing the data
+
+```{r}
+
+url_in <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+shooting_data <- read_csv(url_in)
+
+```
+
+## Tidying the data
+```{r}
+
+### remove columns not needed
+shooting_data_cleaned <- shooting_data %>% select(-LOCATION_DESC, -LOC_OF_OCCUR_DESC, -LOC_CLASSFCTN_DESC, -Lon_Lat)
+### convert the OCCUR_DATE into a date object
+shooting_data_cleaned <- shooting_data_cleaned %>% mutate(OCCUR_DATE = mdy(OCCUR_DATE)) 
+### arrange from oldest to newest by OCCUR_DATE
+shooting_data_cleaned <- shooting_data_cleaned %>% arrange(OCCUR_DATE)
+### convert OCCUR_TIME into time format
+shooting_data_cleaned$OCCUR_TIME <- hms(shooting_data_cleaned$OCCUR_TIME)
+### convert categorical variables into factors
+shooting_data_cleaned <- shooting_data_cleaned %>% mutate(
+     BORO = factor(BORO),
+     PRECINCT = factor(PRECINCT),
+     JURISDICTION_CODE = factor(JURISDICTION_CODE), 
+     PERP_AGE_GROUP = factor(PERP_AGE_GROUP), 
+     PERP_SEX = factor(PERP_SEX), 
+     PERP_RACE = factor(PERP_RACE), 
+     VIC_AGE_GROUP = factor(VIC_AGE_GROUP),
+     VIC_SEX = factor(VIC_SEX),
+     VIC_RACE = factor(VIC_RACE))
+### Get rid of NAs
+shooting_data_cleaned <- shooting_data_cleaned %>% filter(
+  !is.na(JURISDICTION_CODE),
+  !is.na(PERP_SEX),
+  !is.na(PERP_AGE_GROUP),
+  !is.na(Longitude),
+  !is.na(Latitude))
+### combine unknown and null values in column
+shooting_data_cleaned <- shooting_data_cleaned %>%
+     mutate(PERP_AGE_GROUP = recode(PERP_AGE_GROUP,
+                                    "UNKNOWN" = "Unknown",
+                                    "(null)" = "Unknown"))
+shooting_data_cleaned <- shooting_data_cleaned %>%
+     mutate(PERP_RACE = recode(PERP_RACE,
+                                    "UNKNOWN" = "Unknown",
+                                    "(null)" = "Unknown"))
+shooting_data_cleaned <- shooting_data_cleaned %>%
+     mutate(PERP_SEX = recode(PERP_SEX,
+                               "U" = "Unknown",
+                               "(null)" = "Unknown"))
+###recode "U"/"UNKNOWN" to be "Unknown" for consistancy
+shooting_data_cleaned <- shooting_data_cleaned %>%
+     mutate(VIC_SEX = recode(VIC_SEX,
+                              "U" = "Unknown"))
+shooting_data_cleaned <- shooting_data_cleaned %>%
+     mutate(VIC_AGE_GROUP = recode(VIC_AGE_GROUP,
+                             "UNKNOWN" = "Unknown"))
+shooting_data_cleaned <- shooting_data_cleaned %>%
+     mutate(VIC_RACE = recode(VIC_RACE,
+                                   "UNKNOWN" = "Unknown"))
+### locate unique values and clean up
+unique(shooting_data_cleaned$PERP_AGE_GROUP)
+shooting_data_cleaned <- shooting_data_cleaned %>%
+  filter(!PERP_AGE_GROUP %in% c("224", "940", "1020", "1028")) %>% 
+  droplevels() #remove empty factor level
+
+unique(shooting_data_cleaned$VIC_AGE_GROUP)
+shooting_data_cleaned <- shooting_data_cleaned %>%
+     filter(!VIC_AGE_GROUP %in% c("1022")) %>% 
+     droplevels()
+
+### obtain a summary
+summary(shooting_data_cleaned)
+
+### The Unknowns in the applicable columns make sense for that category
+
+```
+### Transformations for visualizations
+```{r}
+
+# Get Yearly data
+yearly_data_for_line_plot <- shooting_data_cleaned %>%
+     mutate(Year = year(OCCUR_DATE)) %>%
+     group_by(Year) %>%
+     summarise(Incidents = n())
+
+
+# What time of day or week do most shooting incidents occur?
+times <- shooting_data_cleaned %>%
+    mutate(
+        Year = year(OCCUR_DATE),
+        Month = month(OCCUR_DATE),
+        Day = day(OCCUR_DATE),
+        Hour = hour(OCCUR_TIME),
+        Weekday = wday(OCCUR_DATE, label = TRUE)
+    )
+# Which Boroughs have the highest shooting incidents?
+shooting_count_by_boro <- shooting_data_cleaned %>%
+    group_by(BORO) %>%               
+    summarise(Incidents = n()) %>%    
+    arrange(desc(Incidents))
+
+```
+
+## Visualizing the data
+
+### _Line Chart 1: Line Chart of shooting incidents by Hour of Day_
+```{r}
+incidents_by_hour <- times %>%
+     group_by(Hour) %>%
+     summarise(Incidents = n()) %>% 
+     ggplot(aes(x = Hour, y = Incidents)) +
+     geom_line(color = "pink", linewidth = 1) +
+     labs(
+         title = "Shooting Incidents by Hour of the Day",
+         x = "Hour of the Day",
+         y = "Number of Incidents"
+     ) +
+     theme_minimal()
+ggplotly(incidents_by_hour)
+```
+### _Line Chart 2: Line Chart of shooting Incidents over Years_
+```{r}
+ggplot(yearly_data_for_line_plot, aes(x = Year, y = Incidents)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(title = "Yearly Shooting Incidents", x = "Year", y = "Number of Incidents") +
+  theme_minimal()
+```
+
+## Analysis for shooting incidents by time
+Line Chart 1 shows that most shooting incidents occurred in the cover of night either the early hours of the morning or later times in the day. As the sun sets, the number of shooting incidents seem to increase. 
+
+Line Chart 2 shows a decline in shooting incidents over years of 2006 to 2019 and then a sudden rise starting from 2020 to 2022 before starting to decrease again. There are some notable events that may have contributed to the increase in the number of shootings from 2019 to 2022 in New York such as the George Floyd protests as well as changes to laws that aimed to decrease the population of inmates in jail leading to repeat offenders being in the population. The sudden decrease in shooting incidents in 2023 could be the result of New York's efforts to decrease the number of firearms in high-crime neighborhoods. 
+
+### _Bar Chart for shooting incidents by borough_
+```{r}
+shooting_by_boro_bar <- shooting_count_by_boro %>%
+    ggplot(aes(x = reorder(BORO, Incidents), y = Incidents, fill = BORO)) + 
+    geom_bar(stat = "identity", show.legend = FALSE) +     
+    labs(
+        title = "Number of Shooting Incidents by Borough",
+        x = "Borough",
+        y = "Number of Shooting Incidents"
+    ) +
+    theme_dark() +
+    coord_flip()  
+shooting_by_boro_bar
+```
+
+### _Heatmap of shooting locations_
+
+```{r}
+leaflet(shooting_data_cleaned) %>%
+  addTiles() %>%  
+  addHeatmap(~Longitude, ~Latitude, blur = 5, max = 1, radius = 11) %>%
+  setView(lng = mean(shooting_data_cleaned$Longitude, na.rm = TRUE),  
+          lat = mean(shooting_data_cleaned$Latitude, na.rm = TRUE),   
+          zoom = 11)
+
+```
+
+## Analysis shooting incidents by borough
+
+There are shooting incidents all over New York, however the heatmap shows that the highest concentration of shootings occur in certain boroughs like the Bronx and Brooklyn neighborhoods. These boroughs were identified using the bar chart which displays the highest shooting incidents by borough. However, a heatmap offered a more visually pleasing view of exactly which areas of New York had the highest shooting incidents as viewers are able to see it spatially displayed on a map. 
+
+## Modeling the data
+```{r}
+#RandomForest to predict death vs. non-death
+set.seed(555)
+
+#split data into training and test data set
+split <- sample.split(shooting_data_cleaned$STATISTICAL_MURDER_FLAG, SplitRatio = 0.8)
+
+data_train <- subset(shooting_data_cleaned, split == TRUE)
+data_test <- subset(shooting_data_cleaned, split == FALSE)
+
+data_train$STATISTICAL_MURDER_FLAG <- as.factor(data_train$STATISTICAL_MURDER_FLAG) #ensure STATISTICAL_MURDER_FLAG is a factor
+data_test$STATISTICAL_MURDER_FLAG <- as.factor(data_test$STATISTICAL_MURDER_FLAG)
+
+
+#train model with fixed seed so easy to reproduce
+rf_model <- randomForest(
+  STATISTICAL_MURDER_FLAG ~ BORO + PERP_RACE + PERP_AGE_GROUP + VIC_RACE + VIC_AGE_GROUP + 
+    PERP_SEX + VIC_SEX,
+  data = data_train,
+  importance = TRUE,
+  ntree = 1500, # increase number of trees to 
+  nodesize = 10,
+  classwt = c(0.54, .46), # adjust weight because there are more non deaths than deaths to increase the accuracy of the model 
+  keep.forest = TRUE,
+  do.trace = 100 #show every 100 OOB value
+)
+
+print(rf_model)
+plot(rf_model)
+
+#make predictions on the test data
+rf_predictions <- predict(rf_model, newdata = data_test)
+
+#plot prediction bar chart
+ # Combine predictions with actual values into a data frame
+comparison_df <- data.frame(
+  Actual = data_test$STATISTICAL_MURDER_FLAG,
+  Predicted = rf_predictions
+)
+
+# Create a bar plot of predicted vs actual values
+ggplot(comparison_df, aes(x = Actual, fill = Predicted)) +
+  geom_bar(position = "fill") +
+  labs(title = "Predicted vs Actual Proportions", y = "Proportion") +
+  scale_fill_manual(values = c("pink", "purple")) +
+  theme_minimal()
+
+
+#get confusion matrix
+conf_matrix <- table(Predicted = rf_predictions, Actual = data_test$STATISTICAL_MURDER_FLAG)
+print(conf_matrix)
+
+
+#plot the factor importance
+importance(rf_model)
+varImpPlot(rf_model)
+
+
+
+```
+
+## Analysis for model 
+A random forest model was used because the STATISTICAL_MURDER_FLAG results in False or True values that were turned into factors and decision trees in the random forest model are good at working with categorical variables in a large dataset. From the model summary, we can see that the error for data that was not part of the training data was 42.15% (OOB). This is quite high so the model is not very good at predicting if a shooting incident resulted in a death as supported by the confusion matrix. The bar chart shows shows the predicted vs the actual proportions of the deaths but the model could be improved. Although efforts were made to improve the model, because of the high amount of non-deaths in the data set, the model became really good at predicting non-deaths but resulted in extremely high errors for predicting deaths. 
+
+Based on feature importance, we can see that Boro is the most important feature to predicting whether a shooting incident results in a death. Through previous visualizations, we saw how the Bronx and Brooklyn neighborhoods had high occurrances of shooting incidents. Perhaps with more research we are able to see if being involved in a shooting incident in one of these neighborhoods is more predictive of a death. 
+
+The other important feature is the Victim's Age Group. It is possible that the younger that a person is, the higher chance that a shooting incident could result in death. This could be confirmed with further analysis. 
+
+## Conclusion / Bias Indentification 
+
+This analysis of the NYPD Shooting Incident Data shows that although there was a decline in shooting incidents since 2006 and then a rise before declining again, there are borughs where shooting incidents are more concentrated than in other boroughs. These findings suggest that there could be more strategies to mitigate the number of shooting incidents by focusing on the high concentration areas. The findings also suggest that by creating an improved model for factors contributing to the STATISTICAL_MURDER_FLAG could lead to more support, funding, and education in certain communities to prevent deaths. 
+
+A personal bias that may have influenced my analysis is that I have viewed all of New York has a high crime area and therefore was not surprised when the map showed much of New York covered in shooting incidents. I mitigated for this by creating a heatmap that identifies the most concentrated areas of shooting incidents instead of just having the map of New York with all the shooting incidents marked on it. 
+
+
+### Resources
+1. https://catalog.data.gov/dataset/nypd-shooting-incident-data-historic
+
+2. https://stackoverflow.com/questions/67537458/creating-a-heatmap-on-r-using-leaflet-function-add-heatmap-or-addheatmap
+
+3. https://rpubs.com/nomarpicasso/1158007
+
+4. https://plotly.com/r/line-charts/
+
+5. https://www.cityandstateny.com/policy/2022/05/what-have-new-york-lawmakers-done-prevent-gun-violence-year/367524/
+
+6. https://www.projectpro.io/recipes/perform-random-forest-r 
+
+7. https://www.geeksforgeeks.org/random-forest-approach-in-r-programming/
